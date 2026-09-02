@@ -504,11 +504,14 @@ export default function GatePassRecords() {
                     <span className="font-semibold w-24 text-right">Driver NIC :</span>
                     <span>{viewingRecord.nic}</span>
                   </div>
-                </div>
-
-                <div className="mb-4 text-sm">
-                  <span className="font-semibold">Customer:</span>
-                  <span className="ml-2">{viewingRecord.customer_name}</span>
+                  <div className="flex gap-2 min-w-0">
+                    <span className="font-semibold w-24 text-right">Customer:</span>
+                    <span className="truncate" title={viewingRecord.customer_name}>{viewingRecord.customer_name}</span>
+                  </div>
+                  <div className="flex gap-2 whitespace-nowrap">
+                    <span className="font-semibold w-24 text-right">Seal Number :</span>
+                    <span>..............................................</span>
+                  </div>
                 </div>
 
                 <table className="w-full text-sm border-collapse border border-black mb-6">
