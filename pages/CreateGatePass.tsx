@@ -426,11 +426,16 @@ export default function CreateGatePass() {
               {selectedDriver?.nic || ""}
             </div>
           </div>
-        </div>
 
-        <div className="mb-4">
-          <Label className="font-semibold">Customer:</Label>
-          <span className="ml-2">{selectedRows[0]?.name}</span>
+          <div className="grid grid-cols-[120px_1fr] items-center gap-2 min-w-0">
+            <Label className="font-semibold text-right whitespace-nowrap">Customer:</Label>
+            <div className="truncate" title={selectedRows[0]?.name}>{selectedRows[0]?.name}</div>
+          </div>
+
+          <div className="grid grid-cols-[120px_1fr] items-center gap-2">
+            <Label className="font-semibold text-right whitespace-nowrap">Seal Number :</Label>
+            <div>..............................................</div>
+          </div>
         </div>
 
         {/* Invoice Table */}
