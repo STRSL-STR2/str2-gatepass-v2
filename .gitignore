@@ -16,6 +16,7 @@ yarn-error.log*
 # Environment files
 .env*
 !.env.example
+!.env.production
 
 # IDE & Editor files
 .vscode/
