@@ -22,11 +22,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     try {
       const { data, error } = await supabase
         .from("app_users")
-        .select("*")
+        .select("id, username, email, role, is_active, created_at")
         .eq("id", userId)
         .single();
 
       if (!error && data) {
+        if (!data.is_active) {
+          setProfile(null);
+          localStorage.removeItem("auth_user");
+          return;
+        }
         setProfile(data as Profile);
         localStorage.setItem("auth_user", JSON.stringify(data));
       }

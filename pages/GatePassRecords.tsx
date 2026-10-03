@@ -8,13 +8,17 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
-import { Search, Loader2, Printer, Eye, Trash2, Edit, Download, CheckCircle, AlertTriangle, Truck } from "lucide-react";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Search, Loader2, Printer, Eye, Trash2, Edit, Download, CheckCircle, AlertTriangle, Truck, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, RotateCcw, Undo2, CheckSquare, Mail, Layers } from "lucide-react";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { format, isToday, isThisWeek, isThisMonth, isWithinInterval, startOfDay, endOfDay } from "date-fns";
 import { useReactToPrint } from "react-to-print";
 import { CompanySettings } from "@/types";
 import * as XLSX from "xlsx";
 import { EditGatePassModal } from "@/components/EditGatePassModal";
+import { logAuditActivity } from "@/lib/audit";
+import { downloadGatePassAsPdf, openOutlookEmailComposer } from "@/lib/gatepass-actions";
+import { cn } from "@/lib/utils";
 
 export default function GatePassRecords() {
   const { profile } = useAuth();
@@ -39,10 +43,22 @@ export default function GatePassRecords() {
   const [customEndDate, setCustomEndDate] = useState<string>("");
   const [completedFilter, setCompletedFilter] = useState("all");
 
+  // Pagination State (100 rows limit)
+  const [currentPage, setCurrentPage] = useState(1);
+  const pageSize = 100;
+
+  // Selection & Bulk Action State
+  const [isSelectionMode, setIsSelectionMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [bulkActionLoading, setBulkActionLoading] = useState(false);
+  const [bulkDeleteConfirmOpen, setBulkDeleteConfirmOpen] = useState(false);
+  const [bulkPrintRecords, setBulkPrintRecords] = useState<GatePassRecord[]>([]);
+  const bulkPrintRef = useRef<HTMLDivElement>(null);
+
   // View/Print Dialog State
   const [viewingRecord, setViewingRecord] = useState<GatePassRecord | null>(null);
   const [editingRecord, setEditingRecord] = useState<GatePassRecord | null>(null);
-    const [completeConfirmOpen, setCompleteConfirmOpen] = useState(false);
+  const [completeConfirmOpen, setCompleteConfirmOpen] = useState(false);
   const [dispatchConfirmOpen, setDispatchConfirmOpen] = useState(false);
   const [actionRecord, setActionRecord] = useState<GatePassRecord | null>(null);
   const [companySettings, setCompanySettings] = useState<CompanySettings | null>(null);
@@ -53,15 +69,22 @@ export default function GatePassRecords() {
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [recordToDelete, setRecordToDelete] = useState<GatePassRecord | null>(null);
 
-  const isAdmin = profile?.role === 'admin';
+  // Super Admin Reversal States
+  const [unpostConfirmOpen, setUnpostConfirmOpen] = useState(false);
+  const [undispatchConfirmOpen, setUndispatchConfirmOpen] = useState(false);
+  const [reversalReason, setReversalReason] = useState("");
+  const [isProcessingAction, setIsProcessingAction] = useState(false);
+
+  const isSuperAdmin = profile?.role === 'super_admin';
+  const isAdmin = profile?.role === 'admin' || isSuperAdmin;
   useEffect(() => {
     if (profile && !isAdmin) {
       setCompletedFilter('pending');
     }
-  }, [profile]);
+  }, [profile, isAdmin]);
 
-  const fetchData = async () => {
-    setLoading(true);
+  const fetchData = async (silent = false) => {
+    if (!silent) setLoading(true);
     try {
       const [{ data: records, error }, { data: settings }] = await Promise.all([
         supabase.from('gate_pass_records').select('*').order('created_at', { ascending: false }),
@@ -71,11 +94,16 @@ export default function GatePassRecords() {
       if (error) throw error;
       
       setData(records as GatePassRecord[]);
-      if (settings) setCompanySettings(settings);
+      if (settings) {
+        setCompanySettings(settings);
+        if (settings.signature_url) {
+          setSignature(settings.signature_url);
+        }
+      }
     } catch (err: any) {
       toast.error(`Error loading records: ${err.message}`);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
 
@@ -96,6 +124,22 @@ export default function GatePassRecords() {
       const { error } = await supabase.from('gate_pass_records').delete().eq('id', recordToDelete.id);
       if (error) throw error;
       
+      await logAuditActivity({
+        action: 'GATE_PASS_DELETED',
+        entity_type: 'gate_pass',
+        entity_id: recordToDelete.gate_pass_no,
+        details: {
+          status: recordToDelete.status,
+          customer: recordToDelete.customer_name,
+          vehicle_number: recordToDelete.vehicle_number,
+          total_cartons: recordToDelete.total_cartons,
+          total_mtrs: recordToDelete.total_mtrs,
+          invoice_count: recordToDelete.invoice_count,
+          invoices: Array.isArray(recordToDelete.rows) ? recordToDelete.rows.map((r: any) => r.invoice) : []
+        },
+        performed_by: profile?.username || 'Admin'
+      });
+
       toast.success(`Gate pass ${recordToDelete.gate_pass_no} deleted successfully.`);
       setData(prev => prev.filter(r => r.id !== recordToDelete.id));
     } catch (err: any) {
@@ -106,23 +150,266 @@ export default function GatePassRecords() {
     }
   };
 
-  
   const handleUpdateStatus = async (status: 'locked' | 'completed' | 'dispatched', recordOverride?: any) => {
     const targetRecord = recordOverride || actionRecord;
     if (!targetRecord) return;
+    
+    // Validation: Cannot post (complete) if gate pass is not dispatched yet!
+    if (status === 'completed' && targetRecord.status !== 'dispatched') {
+      toast.error(`Cannot post Gate Pass ${targetRecord.gate_pass_no}! Goods must be dispatched first before posting.`);
+      setCompleteConfirmOpen(false);
+      return;
+    }
     
     try {
       const { error } = await supabase.from('gate_pass_records').update({ status }).eq('id', targetRecord.id);
       if (error) throw error;
       
-      toast.success(`Gate pass ${targetRecord.gate_pass_no} ${status} successfully.`);
-      fetchData();
+      if (status === 'dispatched') {
+        await logAuditActivity({
+          action: 'GATE_PASS_DISPATCHED',
+          entity_type: 'gate_pass',
+          entity_id: targetRecord.gate_pass_no,
+          details: {
+            vehicle_number: targetRecord.vehicle_number,
+            driver_name: targetRecord.driver_name,
+            total_cartons: targetRecord.total_cartons
+          },
+          performed_by: profile?.username || 'Staff'
+        });
+      } else if (status === 'completed') {
+        await logAuditActivity({
+          action: 'GATE_PASS_POSTED',
+          entity_type: 'gate_pass',
+          entity_id: targetRecord.gate_pass_no,
+          details: {
+            customer: targetRecord.customer_name,
+            total_cartons: targetRecord.total_cartons,
+            total_mtrs: targetRecord.total_mtrs,
+            total_value: targetRecord.total_value
+          },
+          performed_by: profile?.username || 'Admin'
+        });
+      }
+
+      const actionName = status === 'completed' ? 'posted' : status;
+      setData(prev => prev.map(r => r.id === targetRecord.id ? { ...r, status } : r));
+      toast.success(`Gate pass ${targetRecord.gate_pass_no} ${actionName} successfully.`);
+      fetchData(true);
     } catch (err: any) {
       toast.error(`Error updating record: ${err.message}`);
     } finally {
-            setCompleteConfirmOpen(false);
+      setCompleteConfirmOpen(false);
       setActionRecord(null);
     }
+  };
+
+  const handleUnpost = async () => {
+    if (!actionRecord || !isSuperAdmin) return;
+    setIsProcessingAction(true);
+    try {
+      const { error } = await supabase
+        .from('gate_pass_records')
+        .update({ status: 'dispatched' })
+        .eq('id', actionRecord.id);
+      if (error) throw error;
+
+      await logAuditActivity({
+        action: 'GATE_PASS_UNPOSTED',
+        entity_type: 'gate_pass',
+        entity_id: actionRecord.gate_pass_no,
+        details: {
+          previous_status: 'completed',
+          new_status: 'dispatched',
+          reason: reversalReason.trim() || 'No reason specified',
+          customer: actionRecord.customer_name,
+          total_cartons: actionRecord.total_cartons
+        },
+        performed_by: profile?.username || 'Super Admin'
+      });
+
+      setData(prev => prev.map(r => r.id === actionRecord.id ? { ...r, status: 'dispatched' } : r));
+      toast.success(`Gate pass ${actionRecord.gate_pass_no} unposted. Associated invoices marked as Not Posted.`);
+      fetchData(true);
+    } catch (err: any) {
+      toast.error(`Error unposting gate pass: ${err.message}`);
+    } finally {
+      setIsProcessingAction(false);
+      setUnpostConfirmOpen(false);
+      setReversalReason("");
+      setActionRecord(null);
+    }
+  };
+
+  const handleUndispatch = async () => {
+    if (!actionRecord || !isSuperAdmin) return;
+    setIsProcessingAction(true);
+    try {
+      const { error } = await supabase
+        .from('gate_pass_records')
+        .update({ status: 'pending' })
+        .eq('id', actionRecord.id);
+      if (error) throw error;
+
+      await logAuditActivity({
+        action: 'GATE_PASS_UNDISPATCHED',
+        entity_type: 'gate_pass',
+        entity_id: actionRecord.gate_pass_no,
+        details: {
+          previous_status: 'dispatched',
+          new_status: 'pending',
+          reason: reversalReason.trim() || 'No reason specified',
+          customer: actionRecord.customer_name,
+          total_cartons: actionRecord.total_cartons
+        },
+        performed_by: profile?.username || 'Super Admin'
+      });
+
+      setData(prev => prev.map(r => r.id === actionRecord.id ? { ...r, status: 'pending' } : r));
+      toast.success(`Gate pass ${actionRecord.gate_pass_no} reverted to Pending. It can now be edited or deleted.`);
+      fetchData(true);
+    } catch (err: any) {
+      toast.error(`Error reverting dispatch: ${err.message}`);
+    } finally {
+      setIsProcessingAction(false);
+      setUndispatchConfirmOpen(false);
+      setReversalReason("");
+      setActionRecord(null);
+    }
+  };
+
+  // Bulk Selection Handlers
+  const toggleSelectionMode = () => {
+    setIsSelectionMode(prev => {
+      if (prev) {
+        setSelectedIds([]);
+      }
+      return !prev;
+    });
+  };
+
+  const toggleSelectRow = (id: string) => {
+    setSelectedIds(prev => 
+      prev.includes(id) ? prev.filter(item => item !== id) : [...prev, id]
+    );
+  };
+
+  const eligibleDispatchRecords = useMemo(() => {
+    return data.filter(r => selectedIds.includes(r.id) && r.status !== 'dispatched' && r.status !== 'completed');
+  }, [data, selectedIds]);
+
+  const eligiblePostRecords = useMemo(() => {
+    return data.filter(r => selectedIds.includes(r.id) && r.status === 'dispatched');
+  }, [data, selectedIds]);
+
+  const handleBulkDispatch = async () => {
+    if (eligibleDispatchRecords.length === 0) {
+      toast.warning("None of the selected gate passes are pending dispatch.");
+      return;
+    }
+    setBulkActionLoading(true);
+    try {
+      const ids = eligibleDispatchRecords.map(r => r.id);
+      const { error } = await supabase.from('gate_pass_records').update({ status: 'dispatched' }).in('id', ids);
+      if (error) throw error;
+
+      for (const r of eligibleDispatchRecords) {
+        logAuditActivity({
+          action: 'GATE_PASS_DISPATCHED',
+          entity_type: 'gate_pass',
+          entity_id: r.gate_pass_no,
+          details: { vehicle_number: r.vehicle_number, total_cartons: r.total_cartons, bulk: true },
+          performed_by: profile?.username || 'Staff'
+        });
+      }
+
+      setData(prev => prev.map(r => ids.includes(r.id) ? { ...r, status: 'dispatched' } : r));
+      toast.success(`Dispatched ${ids.length} gate pass(es) successfully.`);
+      fetchData(true);
+      setSelectedIds([]);
+    } catch (err: any) {
+      toast.error(`Error in bulk dispatch: ${err.message}`);
+    } finally {
+      setBulkActionLoading(false);
+    }
+  };
+
+  const handleBulkPost = async () => {
+    if (eligiblePostRecords.length === 0) {
+      toast.warning("Only dispatched gate passes can be posted.");
+      return;
+    }
+    setBulkActionLoading(true);
+    try {
+      const ids = eligiblePostRecords.map(r => r.id);
+      const { error } = await supabase.from('gate_pass_records').update({ status: 'completed' }).in('id', ids);
+      if (error) throw error;
+
+      for (const r of eligiblePostRecords) {
+        logAuditActivity({
+          action: 'GATE_PASS_POSTED',
+          entity_type: 'gate_pass',
+          entity_id: r.gate_pass_no,
+          details: { total_cartons: r.total_cartons, total_value: r.total_value, bulk: true },
+          performed_by: profile?.username || 'Admin'
+        });
+      }
+
+      setData(prev => prev.map(r => ids.includes(r.id) ? { ...r, status: 'completed' } : r));
+      toast.success(`Posted ${ids.length} gate pass(es) successfully.`);
+      fetchData(true);
+      setSelectedIds([]);
+    } catch (err: any) {
+      toast.error(`Error in bulk posting: ${err.message}`);
+    } finally {
+      setBulkActionLoading(false);
+    }
+  };
+
+  const handleBulkDelete = async () => {
+    if (selectedIds.length === 0) return;
+    setBulkActionLoading(true);
+    try {
+      const { error } = await supabase.from('gate_pass_records').delete().in('id', selectedIds);
+      if (error) throw error;
+
+      const deletedItems = data.filter(r => selectedIds.includes(r.id));
+      for (const r of deletedItems) {
+        logAuditActivity({
+          action: 'GATE_PASS_DELETED',
+          entity_type: 'gate_pass',
+          entity_id: r.gate_pass_no,
+          details: { status: r.status, bulk: true },
+          performed_by: profile?.username || 'Admin'
+        });
+      }
+
+      setData(prev => prev.filter(r => !selectedIds.includes(r.id)));
+      toast.success(`Deleted ${selectedIds.length} gate pass(es) successfully.`);
+      fetchData(true);
+      setSelectedIds([]);
+      setBulkDeleteConfirmOpen(false);
+    } catch (err: any) {
+      toast.error(`Error in bulk delete: ${err.message}`);
+    } finally {
+      setBulkActionLoading(false);
+    }
+  };
+
+  const handleBulkPrint = useReactToPrint({
+    contentRef: bulkPrintRef,
+    documentTitle: `Bulk_Gate_Passes-${format(new Date(), "yyyyMMdd-HHmm")}`,
+    suppressErrors: true,
+  });
+
+  const handleTriggerBulkPrint = () => {
+    const selectedRecords = data.filter(r => selectedIds.includes(r.id));
+    if (selectedRecords.length === 0) return;
+    setBulkPrintRecords(selectedRecords);
+    toast.info(`Preparing print preview for ${selectedRecords.length} gate pass(es)...`);
+    setTimeout(() => {
+      handleBulkPrint();
+    }, 300);
   };
 
   const handlePrint = useReactToPrint({
@@ -231,11 +518,21 @@ export default function GatePassRecords() {
     });
   }, [data, searchTerm, dateFilter, customStartDate, customEndDate, completedFilter, sortField, sortDirection]);
 
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [searchTerm, dateFilter, customStartDate, customEndDate, completedFilter, sortField, sortDirection]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredData.length / pageSize));
+  const paginatedData = useMemo(() => {
+    const startIndex = (currentPage - 1) * pageSize;
+    return filteredData.slice(startIndex, startIndex + pageSize);
+  }, [filteredData, currentPage, pageSize]);
+
   const companyLogo = companySettings?.logo_url || localStorage.getItem('gate_pass_logo');
 
   return (
-    <div className="flex flex-col flex-1 h-full space-y-4 overflow-hidden">
-      <div className="flex flex-wrap items-center gap-3 bg-slate-50 dark:bg-slate-900/50 p-3 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm mb-2">
+    <div className="flex flex-col flex-1 h-full gap-2 overflow-hidden pb-1">
+      <div className="flex flex-wrap items-center gap-2.5 bg-slate-50 dark:bg-slate-900/50 p-2 rounded-lg border border-slate-200 dark:border-slate-800 shadow-xs mb-0">
         <div className="relative flex-1 min-w-[200px] max-w-sm">
           <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
           <Input 
@@ -312,12 +609,39 @@ export default function GatePassRecords() {
         <Button onClick={handleExportExcel} variant="outline" size="sm" className="h-9">
           <Download className="mr-2 h-4 w-4" /> Export
         </Button>
+
+        <Button 
+          onClick={toggleSelectionMode} 
+          variant={isSelectionMode ? "default" : "outline"} 
+          size="sm" 
+          className={cn("h-9 transition-colors", isSelectionMode && "bg-blue-600 hover:bg-blue-700 text-white")}
+        >
+          <CheckSquare className="mr-2 h-4 w-4" />
+          {isSelectionMode ? `Selection Mode (${selectedIds.length})` : "Select"}
+        </Button>
       </div>
 
       <div className="border rounded-md bg-card w-full min-w-0 flex-1 overflow-auto">
         <Table className="min-w-[1000px]">
           <TableHeader className="bg-slate-200 dark:bg-slate-800 sticky top-0 z-10 shadow-sm">
             <TableRow>
+              {isSelectionMode && (
+                <TableHead className="w-12 text-center whitespace-nowrap">
+                  <Checkbox 
+                    checked={paginatedData.length > 0 && paginatedData.every(r => selectedIds.includes(r.id))}
+                    onCheckedChange={(checked) => {
+                      if (checked) {
+                        const newIds = Array.from(new Set([...selectedIds, ...paginatedData.map(r => r.id)]));
+                        setSelectedIds(newIds);
+                      } else {
+                        const pageIds = paginatedData.map(r => r.id);
+                        setSelectedIds(prev => prev.filter(id => !pageIds.includes(id)));
+                      }
+                    }}
+                    aria-label="Select all on page"
+                  />
+                </TableHead>
+              )}
               <SortableTableHead label="Gate Pass No" field="gate_pass_no" currentSortField={sortField} currentSortDirection={sortDirection} onSort={handleSort} className="whitespace-nowrap" />
               <SortableTableHead label="Date & Time" field="date" currentSortField={sortField} currentSortDirection={sortDirection} onSort={handleSort} className="whitespace-nowrap" />
               <SortableTableHead label="Customer Name" field="customer_name" currentSortField={sortField} currentSortDirection={sortDirection} onSort={handleSort} className="whitespace-nowrap min-w-[200px]" />
@@ -333,7 +657,7 @@ export default function GatePassRecords() {
           <TableBody>
             {loading ? (
               <TableRow>
-                <TableCell colSpan={10} className="h-48 text-center text-muted-foreground">
+                <TableCell colSpan={isSelectionMode ? 11 : 10} className="h-48 text-center text-muted-foreground">
                   <div className="flex flex-col items-center justify-center">
                     <Loader2 className="h-6 w-6 animate-spin mb-2" />
                     Loading records...
@@ -342,13 +666,22 @@ export default function GatePassRecords() {
               </TableRow>
             ) : filteredData.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={10} className="h-48 text-center text-muted-foreground font-medium">
+                <TableCell colSpan={isSelectionMode ? 11 : 10} className="h-48 text-center text-muted-foreground font-medium">
                   No gate pass records found.
                 </TableCell>
               </TableRow>
             ) : (
-              filteredData.map((row) => (
-                <TableRow key={row.id}>
+              paginatedData.map((row) => (
+                <TableRow key={row.id} className={cn(selectedIds.includes(row.id) && "bg-blue-50/50 dark:bg-blue-950/20")}>
+                  {isSelectionMode && (
+                    <TableCell className="text-center w-12">
+                      <Checkbox 
+                        checked={selectedIds.includes(row.id)}
+                        onCheckedChange={() => toggleSelectRow(row.id)}
+                        aria-label={`Select ${row.gate_pass_no}`}
+                      />
+                    </TableCell>
+                  )}
                   <TableCell className="font-semibold text-primary">{row.gate_pass_no}</TableCell>
                   <TableCell>
                     <div className="flex flex-col">
@@ -365,7 +698,7 @@ export default function GatePassRecords() {
                   </TableCell>
                   <TableCell className="text-right font-medium">{(Number(row.total_mtrs) || 0).toLocaleString()}</TableCell>
                   <TableCell className="text-right">{(Number(row.total_value) || 0).toLocaleString()}</TableCell>
-                  <TableCell className="text-right">{row.total_cartons}</TableCell>
+                  <TableCell className="text-right font-semibold">{row.total_cartons}</TableCell>
                   <TableCell>
                     <div className="flex flex-col">
                       <span>{row.created_by}</span>
@@ -384,17 +717,20 @@ export default function GatePassRecords() {
                       <Button variant="ghost" size="icon" onClick={() => setViewingRecord(row)} title="View / Reprint">
                         <Eye className="h-4 w-4" />
                       </Button>
-                      {!isAdmin && row.status !== 'completed' && row.status !== 'dispatched' && (
+                      <Button variant="ghost" size="icon" onClick={() => openOutlookEmailComposer(row)} title="Send via Outlook">
+                        <Mail className="h-4 w-4 text-sky-600 hover:text-sky-700" />
+                      </Button>
+                      {row.status !== 'completed' && row.status !== 'dispatched' && (
                         <Button 
                           variant="ghost" 
                           size="icon" 
-                          title="Dispatch"
+                          title="Dispatch Goods"
                           onClick={() => {
-                              setActionRecord(row);
-                              setDispatchConfirmOpen(true);
-                            }}
+                            setActionRecord(row);
+                            setDispatchConfirmOpen(true);
+                          }}
                         >
-                          <Truck className="h-4 w-4 text-blue-500" />
+                          <Truck className="h-4 w-4 text-blue-500 hover:text-blue-600" />
                         </Button>
                       )}
                       {isAdmin && (
@@ -411,20 +747,76 @@ export default function GatePassRecords() {
                           <Button 
                             variant="ghost" 
                             size="icon" 
-                            title="Complete"
+                            title={
+                              row.status === 'completed' 
+                                ? 'Already Posted' 
+                                : row.status !== 'dispatched' 
+                                  ? 'Cannot post: Must be dispatched first' 
+                                  : 'Post Gate Pass'
+                            }
                             disabled={row.status === 'completed'}
                             onClick={() => {
+                              if (row.status !== 'dispatched') {
+                                toast.error(`Cannot post Gate Pass ${row.gate_pass_no}! Goods must be dispatched first before posting.`);
+                                return;
+                              }
                               setActionRecord(row);
                               setCompleteConfirmOpen(true);
                             }}
+                            className={
+                              row.status === 'completed'
+                                ? 'opacity-40'
+                                : row.status !== 'dispatched'
+                                  ? 'text-slate-400 hover:text-amber-500 dark:text-slate-600 dark:hover:text-amber-400'
+                                  : 'text-emerald-500 hover:text-emerald-600 hover:bg-emerald-50 dark:hover:bg-emerald-950/20'
+                            }
                           >
-                            <CheckCircle className="h-4 w-4 text-emerald-500" />
+                            <CheckCircle className="h-4 w-4" />
                           </Button>
+                          {/* Super Admin Reversal: Unpost */}
+                          {isSuperAdmin && row.status === 'completed' && (
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              title="Unpost Gate Pass (Super Admin)"
+                              className="text-amber-500 hover:text-amber-600 hover:bg-amber-50 dark:hover:bg-amber-950/20"
+                              onClick={() => {
+                                setActionRecord(row);
+                                setReversalReason("");
+                                setUnpostConfirmOpen(true);
+                              }}
+                            >
+                              <RotateCcw className="h-4 w-4" />
+                            </Button>
+                          )}
+                          {/* Super Admin Reversal: Revert to Pending */}
+                          {isSuperAdmin && row.status === 'dispatched' && (
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              title="Revert to Pending (Super Admin)"
+                              className="text-orange-500 hover:text-orange-600 hover:bg-orange-50 dark:hover:bg-orange-950/20"
+                              onClick={() => {
+                                setActionRecord(row);
+                                setReversalReason("");
+                                setUndispatchConfirmOpen(true);
+                              }}
+                            >
+                              <Undo2 className="h-4 w-4" />
+                            </Button>
+                          )}
                           <Button 
                             variant="ghost" 
                             size="icon" 
                             className="text-red-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/20"
-                            disabled={row.status === 'locked' || row.status === 'completed' || row.status === 'dispatched'}
+                            disabled={!isSuperAdmin && (row.status === 'locked' || row.status === 'completed' || row.status === 'dispatched')}
+                            title={
+                              isSuperAdmin
+                                ? "Delete Gate Pass (Super Admin)"
+                                : (row.status === 'completed' || row.status === 'dispatched' || row.status === 'locked')
+                                  ? "Cannot delete processed gate pass"
+                                  : "Delete Gate Pass"
+                            }
                             onClick={() => {
                               setRecordToDelete(row);
                               setDeleteConfirmOpen(true);
@@ -443,12 +835,79 @@ export default function GatePassRecords() {
         </Table>
       </div>
 
+      {/* Compact Pagination Controls */}
+      {filteredData.length > 0 && (
+        <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-1.5 bg-slate-50/90 dark:bg-slate-900/40 rounded-md border border-slate-200 dark:border-slate-800 text-[11px] text-muted-foreground shrink-0 shadow-xs mb-0">
+          <div>
+            Showing <span className="font-semibold text-foreground">{(currentPage - 1) * pageSize + 1}</span> to{" "}
+            <span className="font-semibold text-foreground">{Math.min(currentPage * pageSize, filteredData.length)}</span> of{" "}
+            <span className="font-semibold text-foreground">{filteredData.length}</span> records
+          </div>
+
+          <div className="flex items-center gap-1">
+            <Button
+              variant="outline"
+              size="icon"
+              className="h-7 w-7"
+              onClick={() => setCurrentPage(1)}
+              disabled={currentPage === 1}
+              title="First Page"
+            >
+              <ChevronsLeft className="h-3.5 w-3.5" />
+            </Button>
+            <Button
+              variant="outline"
+              size="icon"
+              className="h-7 w-7"
+              onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
+              disabled={currentPage === 1}
+              title="Previous Page"
+            >
+              <ChevronLeft className="h-3.5 w-3.5" />
+            </Button>
+
+            <span className="px-2 py-0.5 font-medium text-foreground">
+              Page {currentPage} of {totalPages}
+            </span>
+
+            <Button
+              variant="outline"
+              size="icon"
+              className="h-7 w-7"
+              onClick={() => setCurrentPage(prev => Math.min(totalPages, prev + 1))}
+              disabled={currentPage === totalPages}
+              title="Next Page"
+            >
+              <ChevronRight className="h-3.5 w-3.5" />
+            </Button>
+            <Button
+              variant="outline"
+              size="icon"
+              className="h-7 w-7"
+              onClick={() => setCurrentPage(totalPages)}
+              disabled={currentPage === totalPages}
+              title="Last Page"
+            >
+              <ChevronsRight className="h-3.5 w-3.5" />
+            </Button>
+          </div>
+        </div>
+      )}
+
       {/* View / Print Modal */}
       <Dialog open={!!viewingRecord} onOpenChange={(open) => !open && setViewingRecord(null)}>
         <DialogContent className="w-[95vw] max-w-4xl sm:max-w-4xl max-h-[90vh] flex flex-col p-0">
-          <div className="flex items-center justify-between p-4 border-b pr-12">
+          <div className="flex flex-wrap items-center justify-between p-4 border-b gap-2 pr-12">
             <DialogTitle>View Gate Pass: {viewingRecord?.gate_pass_no}</DialogTitle>
-            <Button onClick={() => handlePrint()}><Printer className="mr-2 h-4 w-4" /> Reprint</Button>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button variant="secondary" onClick={() => handlePrint()}><Printer className="mr-2 h-4 w-4" /> Reprint</Button>
+              <Button variant="outline" onClick={() => viewingRecord && downloadGatePassAsPdf(printRef.current, viewingRecord.gate_pass_no)}>
+                <Download className="mr-2 h-4 w-4" /> PDF
+              </Button>
+              <Button variant="outline" onClick={() => viewingRecord && openOutlookEmailComposer(viewingRecord)}>
+                <Mail className="mr-2 h-4 w-4" /> Outlook Email
+              </Button>
+            </div>
           </div>
           
           <div className="flex-1 overflow-auto p-4 sm:p-8 bg-gray-50/50 relative">
@@ -608,16 +1067,16 @@ export default function GatePassRecords() {
         <DialogContent>
           <DialogHeader>
             <DialogTitle className="flex items-center text-emerald-600">
-              <CheckCircle className="h-5 w-5 mr-2" /> Confirm Complete
+              <CheckCircle className="h-5 w-5 mr-2" /> Confirm Post Gate Pass
             </DialogTitle>
             <DialogDescription>
-              Are you sure you want to complete Gate Pass {actionRecord?.gate_pass_no}? All invoices will be marked as Posted in Invoice Records. This will also prevent any further edits.
+              Are you sure you want to post Gate Pass <strong className="font-semibold text-slate-900 dark:text-slate-100">{actionRecord?.gate_pass_no}</strong>? All invoices will be marked as Posted in Invoice Records. This will also prevent any further edits.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button variant="outline" onClick={() => setCompleteConfirmOpen(false)}>Cancel</Button>
-            <Button className="bg-emerald-600 hover:bg-emerald-700 text-white" onClick={() => handleUpdateStatus('completed')}>
-              Complete Gate Pass
+            <Button className="bg-emerald-600 hover:bg-emerald-700 text-white font-medium" onClick={() => handleUpdateStatus('completed')}>
+              Post Gate Pass
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -637,6 +1096,266 @@ export default function GatePassRecords() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* Super Admin Unpost Modal */}
+      <Dialog open={unpostConfirmOpen} onOpenChange={setUnpostConfirmOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle className="flex items-center text-amber-600">
+              <RotateCcw className="h-5 w-5 mr-2" /> Reverse / Unpost Gate Pass
+            </DialogTitle>
+            <DialogDescription>
+              You are about to unpost Gate Pass <strong className="font-semibold text-slate-900 dark:text-slate-100">{actionRecord?.gate_pass_no}</strong>. 
+              This will revert the status back to <span className="font-medium text-blue-600">Dispatched</span>, and all associated invoices in Invoice Records will revert back to <span className="font-medium text-amber-600">Not Posted</span>.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="py-2">
+            <label className="text-xs font-medium text-muted-foreground block mb-1">
+              Reason for Reversal / Unpost (Required for audit log):
+            </label>
+            <Input 
+              placeholder="e.g. Invoiced amount correction required, customer requested revision..."
+              value={reversalReason}
+              onChange={(e) => setReversalReason(e.target.value)}
+              className="text-sm"
+            />
+          </div>
+          <DialogFooter>
+            <Button variant="outline" disabled={isProcessingAction} onClick={() => setUnpostConfirmOpen(false)}>Cancel</Button>
+            <Button 
+              className="bg-amber-600 hover:bg-amber-700 text-white font-medium" 
+              disabled={isProcessingAction}
+              onClick={handleUnpost}
+            >
+              {isProcessingAction ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
+              Confirm Unpost
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Super Admin Undispatch Modal */}
+      <Dialog open={undispatchConfirmOpen} onOpenChange={setUndispatchConfirmOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle className="flex items-center text-orange-600">
+              <Undo2 className="h-5 w-5 mr-2" /> Revert Dispatch to Pending
+            </DialogTitle>
+            <DialogDescription>
+              You are about to revert Gate Pass <strong className="font-semibold text-slate-900 dark:text-slate-100">{actionRecord?.gate_pass_no}</strong> back to <span className="font-medium text-yellow-600">Pending</span>. 
+              This will allow editing carton counts, customer details, or deleting the gate pass.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="py-2">
+            <label className="text-xs font-medium text-muted-foreground block mb-1">
+              Reason for Reversion (Required for audit log):
+            </label>
+            <Input 
+              placeholder="e.g. Wrong vehicle assigned, goods not loaded yet..."
+              value={reversalReason}
+              onChange={(e) => setReversalReason(e.target.value)}
+              className="text-sm"
+            />
+          </div>
+          <DialogFooter>
+            <Button variant="outline" disabled={isProcessingAction} onClick={() => setUndispatchConfirmOpen(false)}>Cancel</Button>
+            <Button 
+              className="bg-orange-600 hover:bg-orange-700 text-white font-medium" 
+              disabled={isProcessingAction}
+              onClick={handleUndispatch}
+            >
+              {isProcessingAction ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
+              Confirm Revert to Pending
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Floating Bulk Action Bar */}
+      {isSelectionMode && selectedIds.length > 0 && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-40 bg-slate-900/95 dark:bg-slate-950/95 text-white border border-slate-700 shadow-2xl rounded-2xl px-5 py-3 flex items-center gap-3 backdrop-blur-md animate-in slide-in-from-bottom-5">
+          <div className="flex items-center gap-2 pr-3 border-r border-slate-700 text-sm font-semibold">
+            <span className="bg-blue-600 text-white px-2 py-0.5 rounded-full text-xs font-bold">{selectedIds.length}</span>
+            <span className="hidden sm:inline">Selected</span>
+          </div>
+
+          <div className="flex items-center gap-2">
+            {/* Bulk Dispatch */}
+            <Button
+              size="sm"
+              variant="outline"
+              className="text-xs bg-slate-800 hover:bg-slate-700 text-white border-slate-600 h-8"
+              onClick={handleBulkDispatch}
+              disabled={bulkActionLoading || eligibleDispatchRecords.length === 0}
+              title="Dispatch selected pending gate passes"
+            >
+              <Truck className="h-3.5 w-3.5 mr-1.5 text-blue-400" />
+              Dispatch ({eligibleDispatchRecords.length})
+            </Button>
+
+            {/* Bulk Post */}
+            {isAdmin && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="text-xs bg-slate-800 hover:bg-slate-700 text-white border-slate-600 h-8"
+                onClick={handleBulkPost}
+                disabled={bulkActionLoading || eligiblePostRecords.length === 0}
+                title="Post selected dispatched gate passes"
+              >
+                <CheckCircle className="h-3.5 w-3.5 mr-1.5 text-emerald-400" />
+                Post ({eligiblePostRecords.length})
+              </Button>
+            )}
+
+            {/* Bulk Print */}
+            <Button
+              size="sm"
+              variant="outline"
+              className="text-xs bg-slate-800 hover:bg-slate-700 text-white border-slate-600 h-8"
+              onClick={handleTriggerBulkPrint}
+              disabled={bulkActionLoading}
+              title="Batch print all selected gate passes"
+            >
+              <Printer className="h-3.5 w-3.5 mr-1.5 text-amber-400" />
+              Print ({selectedIds.length})
+            </Button>
+
+            {/* Bulk Delete */}
+            {isAdmin && (
+              <Button
+                size="sm"
+                variant="destructive"
+                className="text-xs h-8"
+                onClick={() => setBulkDeleteConfirmOpen(true)}
+                disabled={bulkActionLoading}
+              >
+                <Trash2 className="h-3.5 w-3.5 mr-1.5" />
+                Delete
+              </Button>
+            )}
+
+            <Button
+              size="sm"
+              variant="ghost"
+              className="text-xs text-slate-400 hover:text-white h-8"
+              onClick={() => setSelectedIds([])}
+            >
+              Clear
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* Bulk Delete Confirm Modal */}
+      <Dialog open={bulkDeleteConfirmOpen} onOpenChange={setBulkDeleteConfirmOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle className="flex items-center text-red-600">
+              <Trash2 className="h-5 w-5 mr-2" /> Confirm Bulk Delete
+            </DialogTitle>
+            <DialogDescription>
+              Are you sure you want to permanently delete {selectedIds.length} selected gate pass(es)? This action cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setBulkDeleteConfirmOpen(false)} disabled={bulkActionLoading}>Cancel</Button>
+            <Button variant="destructive" onClick={handleBulkDelete} disabled={bulkActionLoading}>
+              {bulkActionLoading ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : null}
+              Delete {selectedIds.length} Records
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Hidden Bulk Print Container */}
+      <div className="hidden">
+        <div ref={bulkPrintRef}>
+          {bulkPrintRecords.map((gp, index) => (
+            <div key={gp.id} className="p-8 bg-white text-black gate-pass-container" style={{ pageBreakAfter: index < bulkPrintRecords.length - 1 ? 'always' : 'auto' }}>
+              <div className="text-center mb-6 pt-4">
+                {companyLogo && (
+                  <div className="flex justify-center mb-4">
+                    <img src={companyLogo} alt="Company Logo" className="h-16 object-contain" referrerPolicy="no-referrer" />
+                  </div>
+                )}
+                <h2 className="text-xl font-bold uppercase">{companySettings?.company_name || 'Stretchline (Private) Limited'}</h2>
+                <p className="text-sm">{companySettings?.business_address}</p>
+                {companySettings?.registered_address && <p className="text-sm">{companySettings.registered_address}</p>}
+                <p className="text-sm">{companySettings?.contact_line}</p>
+                <div className="mt-4 py-2 border-y-2 border-black font-bold text-lg text-center tracking-widest">
+                  CONTROLLED BY COMMERCIAL & LOGISTICS DEPARTMENT
+                </div>
+                <h3 className="mt-4 text-xl font-bold uppercase underline">GATE PASS</h3>
+              </div>
+
+              <div className="grid grid-cols-2 gap-x-12 gap-y-4 mb-6 text-sm">
+                <div className="flex gap-2"><span className="font-semibold w-24 text-right">Gate Pass No :</span><span className="font-bold">{gp.gate_pass_no}</span></div>
+                <div className="flex gap-2"><span className="font-semibold w-24 text-right">Vehicle No :</span><span>{gp.vehicle_number}</span></div>
+                <div className="flex gap-2"><span className="font-semibold w-24 text-right">Date :</span><span>{gp.date}</span></div>
+                <div className="flex gap-2"><span className="font-semibold w-24 text-right">Driver Name :</span><span>{gp.driver_name}</span></div>
+                <div className="flex gap-2"><span className="font-semibold w-24 text-right">Time :</span><span>{gp.time}</span></div>
+                <div className="flex gap-2"><span className="font-semibold w-24 text-right">Phone No :</span><span>{gp.phone_number}</span></div>
+                <div className="flex gap-2"><span className="font-semibold w-24 text-right">Location :</span><span>{gp.location}</span></div>
+                <div className="flex gap-2"><span className="font-semibold w-24 text-right">Driver NIC :</span><span>{gp.nic}</span></div>
+                <div className="flex gap-2"><span className="font-semibold w-24 text-right">Customer :</span><span>{gp.customer_name}</span></div>
+                <div className="flex gap-2"><span className="font-semibold w-24 text-right">Seal Number :</span><span>........................................</span></div>
+              </div>
+
+              <table className="w-full text-sm border-collapse border border-black mb-6">
+                <thead>
+                  <tr className="bg-gray-100">
+                    <th className="border border-black p-2 w-12 text-center">NO</th>
+                    <th className="border border-black p-2 text-left">INVOICE NO</th>
+                    <th className="border border-black p-2 text-left">DO / BOL</th>
+                    <th className="border border-black p-2 text-right">MTRS</th>
+                    <th className="border border-black p-2 text-center w-24">CTN</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {gp.rows && gp.rows.map((row: any, rIdx: number) => (
+                    <tr key={rIdx}>
+                      <td className="border border-black p-2 text-center">{rIdx + 1}</td>
+                      <td className="border border-black p-2 font-medium">{row.invoice}</td>
+                      <td className="border border-black p-2">{row.do || "-"}</td>
+                      <td className="border border-black p-2 text-right">{(Number(row.mtrs) || 0).toLocaleString()}</td>
+                      <td className="border border-black p-2 text-center">{row.cartons || 0}</td>
+                    </tr>
+                  ))}
+                  <tr>
+                    <td colSpan={3} className="border border-black p-2 font-bold text-right">TOTAL</td>
+                    <td className="border border-black p-2 font-bold text-right">{(Number(gp.total_mtrs) || 0).toLocaleString()}</td>
+                    <td className="border border-black p-2 font-bold text-center">{gp.total_cartons}</td>
+                  </tr>
+                </tbody>
+              </table>
+
+              <div className="flex justify-between items-center font-bold text-lg mb-12">
+                <div>TOTAL NUMBER OF CARTONS = <span className="border-b border-black inline-block w-16 text-center">{gp.total_cartons}</span></div>
+              </div>
+
+              <div className="grid grid-cols-3 gap-8 text-center mt-8 mb-6">
+                <div className="flex flex-col items-center justify-end h-20">
+                  {signature && (
+                    <img src={signature} alt="Signature" className="max-h-14 max-w-[140px] object-contain mb-1" referrerPolicy="no-referrer" />
+                  )}
+                  <div className="w-full border-t border-black pt-1 px-4 font-semibold text-xs">Authorized By</div>
+                </div>
+                <div className="flex flex-col items-center justify-end h-20">
+                  <div className="w-full border-t border-black pt-1 px-4 font-semibold text-xs">Issued By</div>
+                </div>
+                <div className="flex flex-col items-center justify-end h-20">
+                  <div className="w-full border-t border-black pt-1 px-4 font-semibold text-xs">Received By</div>
+                </div>
+              </div>
+
+              <div className="text-[10px] text-gray-500 mt-6">
+                Created by: {gp.created_by} at {format(new Date(gp.created_at), "dd/MM/yyyy HH:mm:ss")}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }
